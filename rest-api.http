@@ -1,0 +1,17 @@
+### Health
+GET http://localhost/up
+Accept: application/json
+
+### Send POST request with json body
+POST http://localhost/api/notifications/batch
+Content-Type: application/json
+
+{
+    "notifications": [
+        {
+            "recipient": "sergiu.bogos@gmail.com",
+            "content": "Welcome on board",
+            "channel": "sms"
+        }
+    ]
+}

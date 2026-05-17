@@ -1,0 +1,339 @@
+openapi: 3.0.3
+
+info:
+  title: Notifications API
+  description: |
+    Event-driven notification system. Accepts notification requests through a single
+    or batch endpoint, persists them to MySQL, and dispatches delivery to an external
+    provider asynchronously via a scheduler-driven worker pipeline.
+
+    **Dispatch model.** All notifications are persisted with `status=pending`. A scheduler
+    runs every minute (`app:process-notifications`) and enqueues due rows to per-priority
+    Redis queues. A `queue:work` worker pulls jobs, hits the external provider (webhook.site),
+    applies per-channel rate limiting (X msg/sec/channel), and transitions rows to
+    `processed` or `failed`.
+  version: 0.1.0
+  contact:
+    name: Insider One
+    url: https://github.com/sergiu17/laravel-notifications
+
+servers:
+  - url: http://localhost
+    description: Local development (Docker Compose)
+
+tags:
+  - name: Notifications
+    description: Create, list, query, and cancel notifications
+  - name: Health
+    description: Service health probes
+
+security:
+  - sanctumToken: []
+
+paths:
+
+  /up:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: |
+        Laravel's built-in health endpoint. Returns 200 if the application can boot.
+        Listeners for `DiagnosingHealth` can extend this to verify DB / Redis.
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        '500':
+          description: A dependency check threw an exception
+
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: List notifications (with filters and cursor pagination)
+      description: |
+        Returns notifications matching the provided filters. All filter parameters are
+        optional and additive. Cursor-paginated, 25 per page.
+
+        Single-notification and batch-membership lookups both use this endpoint:
+          * `?id={id}` for a single row
+          * `?batch_id={ulid}` for all rows in a batch
+      parameters:
+        - in: query
+          name: id
+          schema: { type: string }
+          description: Exact notification ID (bigint)
+        - in: query
+          name: batch_id
+          schema: { type: string, format: ulid }
+          description: ULID of the batch to scope to
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/NotificationStatus' }
+        - in: query
+          name: channel
+          schema: { $ref: '#/components/schemas/Channel' }
+        - in: query
+          name: from
+          schema: { type: string, format: date-time }
+          description: Created-at lower bound (inclusive)
+        - in: query
+          name: to
+          schema: { type: string, format: date-time }
+          description: Created-at upper bound (inclusive). Must be `>= from`.
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Cursor pagination token from a previous response
+      responses:
+        '200':
+          description: A page of notifications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CursorPaginatedNotifications'
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+    post:
+      tags: [Notifications]
+      summary: Create a single notification
+      description: |
+        Persists one notification with `status=pending`. The scheduler will enqueue it
+        on its next tick (≤ 60s). For higher throughput, use the batch endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNotificationRequest'
+      responses:
+        '200':
+          description: Notification persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/notifications/batch:
+    post:
+      tags: [Notifications]
+      summary: Create up to 1000 notifications in one request
+      description: |
+        Persists a batch of notifications under a single `batch_id` (auto-generated ULID).
+        Atomic-ish — all rows share the same `batch_id` so they can be queried as a group
+        via `GET /api/notifications?batch_id=...`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBatchRequest'
+      responses:
+        '201':
+          description: Batch persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/notifications/{notification}:
+    delete:
+      tags: [Notifications]
+      summary: Cancel a pending notification
+      description: |
+        Soft-deletes a notification. Only `pending` notifications can be cancelled —
+        anything already `queued`, `processed`, `failed`, or `cancelled` returns 422.
+
+        Implemented as DELETE because the row is soft-deleted; the assignment names this
+        operation "cancel" semantically.
+      parameters:
+        - in: path
+          name: notification
+          required: true
+          schema: { type: integer }
+          description: Notification ID
+      responses:
+        '204':
+          description: Cancelled (soft-deleted)
+        '404':
+          description: Notification not found
+        '422':
+          description: Notification is not in `pending` state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Notification cannot be canceled.
+
+components:
+
+  securitySchemes:
+    sanctumToken:
+      type: http
+      scheme: bearer
+      bearerFormat: PAT
+      description: Laravel Sanctum personal access token
+
+  schemas:
+
+    Channel:
+      type: string
+      enum: [sms, email, push]
+      example: sms
+
+    NotificationStatus:
+      type: string
+      enum: [pending, invalid, cancelled, queued, failed, processed]
+      example: pending
+
+    NotificationPriority:
+      type: string
+      enum: [high, default, low]
+      example: default
+
+    Notification:
+      type: object
+      required: [id, batch_id, channel, recipient, content, priority, status]
+      properties:
+        id:
+          type: integer
+          description: Auto-increment primary key
+          example: 42
+        batch_id:
+          type: string
+          format: ulid
+          description: ULID grouping the notification with its batch siblings
+          example: 01jzw4t8r3hf9zsmyab8xj62kq
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
+          type: string
+          example: "+905551234567"
+          description: Phone number, email, or push token depending on channel
+        content:
+          type: string
+          example: "Your verification code is 123456"
+        scheduled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the scheduler should pick this up (null = immediate)
+        priority:
+          $ref: '#/components/schemas/NotificationPriority'
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+        created_at:
+          type: string
+          format: date-time
+
+    CreateNotificationRequest:
+      type: object
+      required: [recipient, content, channel]
+      properties:
+        recipient:
+          type: string
+          maxLength: 255
+        content:
+          type: string
+        channel:
+          $ref: '#/components/schemas/Channel'
+        fallback_channel:
+          $ref: '#/components/schemas/Channel'
+        priority:
+          $ref: '#/components/schemas/NotificationPriority'
+        scheduled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Must be a future timestamp if provided
+      example:
+        recipient: "+905551234567"
+        content: "Your verification code is 123456"
+        channel: sms
+
+    CreateBatchRequest:
+      type: object
+      required: [notifications]
+      properties:
+        notifications:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/CreateNotificationRequest'
+      example:
+        notifications:
+          - recipient: "+905551234567"
+            channel: sms
+            content: "Code 1"
+            priority: high
+          - recipient: "alice@example.com"
+            channel: email
+            content: "Welcome aboard"
+
+    BatchResponse:
+      type: object
+      required: [batch_id]
+      properties:
+        batch_id:
+          type: string
+          format: ulid
+          description: Shared batch identifier; use `GET /api/notifications?batch_id=...` to retrieve members
+          example: 01jzw4t8r3hf9zsmyab8xj62kq
+
+    CursorPaginatedNotifications:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        links:
+          type: object
+          properties:
+            first: { type: string, nullable: true }
+            last:  { type: string, nullable: true }
+            prev:  { type: string, nullable: true }
+            next:  { type: string, nullable: true, example: "http://localhost/api/notifications?cursor=eyJpZCI6MTAwfQ" }
+        meta:
+          type: object
+          properties:
+            path:         { type: string, example: "http://localhost/api/notifications" }
+            per_page:     { type: integer, example: 25 }
+            next_cursor:  { type: string, nullable: true }
+            prev_cursor:  { type: string, nullable: true }
+
+    ValidationError:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "The recipient field is required."
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          example:
+            recipient: ["The recipient field is required."]
+            channel:   ["The channel field is required."]
+
+  responses:
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
